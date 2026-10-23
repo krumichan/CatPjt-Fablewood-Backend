@@ -1,6 +1,9 @@
 #requires -Version 7.4
 [CmdletBinding()]
 param(
+    [ValidatePattern('^[a-z0-9][a-z0-9_.-]{0,62}$')][string]$ContainerName='fablewood-postgres',
+    [ValidatePattern('^[a-z0-9][a-z0-9_.-]{0,62}$')][string]$VolumeName='fablewood-postgres-data',
+    [ValidatePattern('^[a-z0-9][a-z0-9_-]{0,62}$')][string]$ComposeProject='fablewood-backend',
     [ValidateRange(1024,65535)][int]$DatabasePort=55438,
     [ValidateRange(1024,65535)][int]$ApiPort=5281,
     [ValidatePattern('^[a-z][a-z0-9_]{0,62}$')][string]$Schema='fablewood',
@@ -22,9 +25,6 @@ $keyPath=Join-Path $privateRoot 'server-key.txt'
 $serverConfig=Join-Path $privateRoot 'server.json'
 $envFile=Join-Path $privateRoot '.env.local'
 $statePath=Join-Path $privateRoot 'backend-state.json'
-$containerName='fablewood-postgres'
-$volumeName='fablewood-postgres-data'
-$composeProject='fablewood-backend'
 $baseUrl="http://127.0.0.1:$ApiPort"
 $docker=(Get-Command docker.exe -ErrorAction Stop).Source
 foreach ($required in @($backendExe,$backendDll,$composeFile)) {
@@ -144,6 +144,12 @@ if (Test-Path -LiteralPath $credentialsPath) {
         [IO.Path]::GetFullPath([string]$credentials.projectRoot) -ne $projectRoot) {
         throw 'Stored credentials do not match the requested settings. They were preserved; no database was reset.'
     }
+    foreach ($binding in @(@{name='containerName';value=$ContainerName;legacy='fablewood-postgres'},@{name='volumeName';value=$VolumeName;legacy='fablewood-postgres-data'},@{name='composeProject';value=$ComposeProject;legacy='fablewood-backend'})) {
+        $property=$credentials.PSObject.Properties[$binding.name]
+        if (($null -eq $property -and $binding.value -cne $binding.legacy) -or ($null -ne $property -and [string]$property.Value -cne $binding.value)) {
+            throw 'Stored database instance identity differs from the requested instance. Existing storage was preserved.'
+        }
+    }
     if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) { throw 'Server key is missing; restore the existing private key rather than replacing it.' }
     $serverKey=[IO.File]::ReadAllText($keyPath).Trim()
     if ($serverKey -notmatch '^[a-f0-9]{64}$') { throw 'Stored server key has an unexpected format and was preserved.' }
@@ -151,13 +157,13 @@ if (Test-Path -LiteralPath $credentialsPath) {
     if ($existingContainer -or (Test-Path -LiteralPath $keyPath) -or (Test-Path -LiteralPath $serverConfig) -or (Test-Path -LiteralPath $envFile)) {
         throw 'Partial private configuration or an existing database was found. Restore the complete set; no secret was replaced.'
     }
-    $credentials=[ordered]@{version=1;projectRoot=$projectRoot;databasePassword=(New-BackendSecret);databasePort=$DatabasePort;apiPort=$ApiPort;schema=$Schema;serverId=$ServerId;serverKeyFile=$keyPath}
+    $credentials=[ordered]@{version=2;projectRoot=$projectRoot;containerName=$ContainerName;volumeName=$VolumeName;composeProject=$ComposeProject;databasePassword=(New-BackendSecret);databasePort=$DatabasePort;apiPort=$ApiPort;schema=$Schema;serverId=$ServerId;serverKeyFile=$keyPath}
     $serverKey=New-BackendSecret
     [IO.File]::WriteAllText($keyPath,$serverKey+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
     Write-BackendJson $credentialsPath $credentials
 }
 # Minimal required copies: Docker receives only DB credentials; UE receives only its API key.
-[IO.File]::WriteAllText($envFile,"FABLE_PG_PORT=$DatabasePort`nFABLE_PG_PASSWORD=$($credentials.databasePassword)`n",[Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($envFile,"FABLE_PG_PORT=$DatabasePort`nFABLE_PG_PASSWORD=$($credentials.databasePassword)`nFABLE_PG_CONTAINER=$ContainerName`nFABLE_PG_VOLUME=$VolumeName`nFABLE_COMPOSE_PROJECT=$ComposeProject`n",[Text.UTF8Encoding]::new($false))
 Write-BackendJson $serverConfig ([ordered]@{url=$baseUrl;serverId=$ServerId;serverKey=$serverKey})
 $serverKey=$null
 $runId=(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
@@ -195,7 +201,7 @@ if (-not $migration.WaitForExit(120000)) {
 }
 if ($migration.ExitCode -ne 0) { throw "Explicit schema migration failed with exit code $($migration.ExitCode). See $logRoot. API was not started." }
 $api=Start-Process -FilePath $backendExe -WorkingDirectory $backendRoot -WindowStyle Hidden -Environment $childEnvironment -PassThru -RedirectStandardOutput (Join-Path $logRoot 'api.stdout.log') -RedirectStandardError (Join-Path $logRoot 'api.stderr.log')
-$state=[ordered]@{status='starting';runId=$runId;projectRoot=$projectRoot;backendPid=$api.Id;backendExe=$backendExe;backendDll=$backendDll;processStartedUtc=$api.StartTime.ToUniversalTime().ToString('o');serverConfig=$serverConfig;baseUrl=$baseUrl;serverId=$ServerId;containerName=$containerName;volume=$volumeName;databasePort=$DatabasePort;schema=$Schema;logs=$logRoot;privateAclProtected=$aclProtected;health='pending'}
+$state=[ordered]@{status='starting';runId=$runId;projectRoot=$projectRoot;backendPid=$api.Id;backendExe=$backendExe;backendDll=$backendDll;processStartedUtc=$api.StartTime.ToUniversalTime().ToString('o');serverConfig=$serverConfig;baseUrl=$baseUrl;serverId=$ServerId;containerName=$containerName;volume=$volumeName;composeProject=$ComposeProject;databasePort=$DatabasePort;schema=$Schema;logs=$logRoot;privateAclProtected=$aclProtected;health='pending'}
 Write-BackendJson $statePath $state
 $deadline=[DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
 do {

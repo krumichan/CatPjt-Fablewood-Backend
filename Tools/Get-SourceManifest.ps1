@@ -56,6 +56,8 @@ $required=@('.gitignore','README.md','global.json','compose.yaml','.env.example'
     'Fablewood.Backend/Fablewood.Backend.csproj','Fablewood.Backend/packages.lock.json',
     'Fablewood.Backend/BackendOptions.cs','Fablewood.Backend/Contracts.cs','Fablewood.Backend/SqlStore.cs','Fablewood.Backend/Program.cs',
     'Fablewood.Backend/Migrations/001_initial.sql','Fablewood.Backend/README.md',
+    'Fablewood.Backend/InventoryContracts.cs','Fablewood.Backend/InventoryStore.cs','Fablewood.Backend/Migrations/002_inventory.sql',
+    'Fablewood.Backend.IntegrationTests/InventoryTests.cs',
     'Fablewood.Backend.IntegrationTests/Fablewood.Backend.IntegrationTests.csproj',
     'Fablewood.Backend.IntegrationTests/packages.lock.json','Fablewood.Backend.IntegrationTests/Program.cs')
 foreach ($relative in $required) { if ($relative -notin $paths) { throw "Required backend source was omitted: $relative" } }

@@ -1,8 +1,8 @@
-name: fablewood-backend
+name: ${FABLE_COMPOSE_PROJECT:-fablewood-backend}
 services:
   postgres:
     image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
-    container_name: fablewood-postgres
+    container_name: ${FABLE_PG_CONTAINER:-fablewood-postgres}
     environment:
       POSTGRES_DB: fablewood
       POSTGRES_USER: fablewood
@@ -20,4 +20,4 @@ services:
     restart: unless-stopped
 volumes:
   fablewood-postgres-data:
-    name: fablewood-postgres-data
+    name: ${FABLE_PG_VOLUME:-fablewood-postgres-data}
