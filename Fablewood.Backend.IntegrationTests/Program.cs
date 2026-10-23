@@ -10,7 +10,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     private static readonly List<string> Checks = [];
@@ -76,6 +76,14 @@ internal static class Program
                 var path = Path.GetFullPath(args[1]);
                 var expected = JsonSerializer.Deserialize<Checkpoint>(await File.ReadAllTextAsync(path), Json) ?? throw new InvalidOperationException("Missing checkpoint.");
                 await Verify(Isolated(configured, expected.Schema), expected);
+                var inventoryCheckpointPath = Path.Combine(Path.GetDirectoryName(path)!, "inventory-persistence-checkpoint.json");
+                if (File.Exists(inventoryCheckpointPath))
+                {
+                    var inventoryCheckpoint = JsonSerializer.Deserialize<InventoryCheckpoint>(await File.ReadAllTextAsync(inventoryCheckpointPath), Json)
+                        ?? throw new InvalidOperationException("Missing inventory checkpoint.");
+                    if (inventoryCheckpoint.Schema != expected.Schema) throw new InvalidOperationException("Inventory checkpoint belongs to a different isolated schema.");
+                    await VerifyInventoryPersistence(Isolated(configured, expected.Schema), inventoryCheckpoint);
+                }
                 await WriteNew(Path.Combine(Path.GetDirectoryName(path)!, "persistence-after-reconnect.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, expected.Schema, checks = Checks, scope = "New connection after an operator-controlled restart; this program does not restart PostgreSQL or assert that a restart occurred." });
                 return 0;
             }
@@ -181,9 +189,18 @@ internal static class Program
             }
             finally { await app.StopAsync(); await app.DisposeAsync(); }
             await Verify(options, checkpoint!); // New connections after the API datasource is closed.
+            if (Checks.Count != 65) throw new InvalidOperationException("The unchanged legacy regression must complete all 65 checks before inventory coverage starts.");
+            var legacyCheckCount = Checks.Count;
             await WriteNew(Path.Combine(output, "persistence-checkpoint.json"), checkpoint!);
-            await WriteNew(Path.Combine(output, "integration.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, options.Schema, checks = Checks, databaseRestartObserved = false, scope = "Unique PostgreSQL schema, real loopback HTTP. Expiry/fault fixtures only in this schema. PostgreSQL restart is an explicit operator follow-up; no real game profile was mutated." });
+            await RunInventorySuite(options, output);
+            await WriteNew(Path.Combine(output, "integration.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, options.Schema, legacyCheckCount, inventoryCheckCount = Checks.Count - legacyCheckCount, checks = Checks, databaseRestartObserved = false, scope = "Unique PostgreSQL schema, real loopback HTTP. Expiry/fault fixtures only in this schema. PostgreSQL restart is an explicit operator follow-up; no real game profile was mutated." });
             Console.WriteLine("Integration checks passed. Preserve the isolated schema for explicit restart verification."); return 0;
+        }
+        catch (PostgresException error)
+        {
+            // Never print Message/Detail, SQL text, connection strings, credentials or profile bytes.
+            Console.Error.WriteLine($"Integration PostgreSQL failed: checks={Checks.Count} sqlstate={error.SqlState} severity={error.InvariantSeverity} schema={error.SchemaName ?? "-"} table={error.TableName ?? "-"} column={error.ColumnName ?? "-"} constraint={error.ConstraintName ?? "-"} routine={error.Routine ?? "-"} position={error.Position}");
+            return 1;
         }
         catch (Exception error) { Console.Error.WriteLine("Integration failed: " + error.GetType().Name + (error is InvalidOperationException ? " / " + error.Message : "")); return 1; }
     }

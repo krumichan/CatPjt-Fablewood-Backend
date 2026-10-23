@@ -19,7 +19,7 @@ public sealed record Wallet(int Gold, int Ore, int Essence, int RootCores, int M
             throw new ApiError(400, "invalid_wallet", "재화 또는 물약 수량이 허용 범위를 벗어났습니다.");
     }
 }
-public sealed record ClaimResponse(Guid PlayerId, Guid LeaseId, DateTime LeaseExpiry, long Revision, int InitialClass, string? Profile, string? ProfileHash, Wallet Wallet);
+public sealed record ClaimResponse(Guid PlayerId, Guid LeaseId, DateTime LeaseExpiry, long Revision, int InitialClass, string? Profile, string? ProfileHash, Wallet Wallet, int InventoryVersion = 0, InventorySnapshot? Inventory = null);
 public sealed record CommitResponse(long Revision, string ProfileHash);
 public sealed class ApiError(int status, string code, string message) : Exception(message)
 {

@@ -78,6 +78,8 @@ public static class BackendApplication
         app.MapGet("/v1/me", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.Me(await store.Authenticate(Bearer(context), ct), ct)));
         app.MapPost("/v1/server/claim", async (ClaimRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Claim(request, ct)));
         app.MapPost("/v1/server/commit", async (CommitRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Commit(request, ct)));
+        app.MapPost("/v1/server/commit-inventory", async (CommitInventoryRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.CommitInventory(request, ct)));
+        app.MapGet("/v1/me/inventory", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.MeInventory(await store.Authenticate(Bearer(context), ct), ct)));
         app.MapPost("/v1/server/heartbeat", async (LeaseRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Heartbeat(request, ct)));
         app.MapPost("/v1/server/release", async (LeaseRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Release(request, ct)));
         return app;
@@ -98,7 +100,7 @@ public static class Program
         {
             if (args.Length != 0 && !(args.Length == 1 && args[0] == "--migrate")) throw new InvalidOperationException("Only --migrate is supported; configure credentials through private environment/files.");
             var options = BackendOptions.FromEnvironment();
-            if (args.Length == 1) { await using var store = new SqlStore(options); await store.Migrate(CancellationToken.None); Console.WriteLine("Database schema version 1 ready."); return 0; }
+            if (args.Length == 1) { await using var store = new SqlStore(options); await store.Migrate(CancellationToken.None); Console.WriteLine("Database schema version 2 ready."); return 0; }
             await using var app = BackendApplication.Build(options); await app.RunAsync(); return 0;
         }
         catch (Exception error)

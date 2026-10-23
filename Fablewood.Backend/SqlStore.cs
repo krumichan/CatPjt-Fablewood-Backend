@@ -3,7 +3,7 @@ using Npgsql;
 
 namespace Fablewood.Backend;
 
-public sealed class SqlStore(BackendOptions options) : IAsyncDisposable
+public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
 {
     private readonly NpgsqlDataSource data = NpgsqlDataSource.Create(options.ConnectionString);
     private static readonly byte[] DummySalt = new byte[32];
@@ -22,18 +22,26 @@ public sealed class SqlStore(BackendOptions options) : IAsyncDisposable
         await using (var gate = Command(connection, transaction, "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", options.Schema)) await gate.ExecuteNonQueryAsync(ct);
         // Schema identifier was restricted to ASCII alphanumeric/underscore in options.
         await using (var schema = Command(connection, transaction, $"CREATE SCHEMA IF NOT EXISTS \"{options.Schema}\"")) await schema.ExecuteNonQueryAsync(ct);
-        await using var stream = typeof(SqlStore).Assembly.GetManifestResourceStream("Fablewood.Backend.Migrations.001_initial.sql") ?? throw new InvalidOperationException("Embedded migration missing.");
-        using var reader = new StreamReader(stream);
-        await using (var migration = Command(connection, transaction, await reader.ReadToEndAsync(ct))) await migration.ExecuteNonQueryAsync(ct);
-        await using (var version = Command(connection, transaction, "SELECT max(version) FROM schema_migrations"))
-            if (Convert.ToInt32(await version.ExecuteScalarAsync(ct)) != 1) throw new InvalidOperationException("Unsupported database schema version.");
+        await using (var bootstrap = Command(connection, transaction, "CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())")) await bootstrap.ExecuteNonQueryAsync(ct);
+        int current;
+        await using (var version = Command(connection, transaction, "SELECT COALESCE(max(version),0) FROM schema_migrations"))
+            current = Convert.ToInt32(await version.ExecuteScalarAsync(ct));
+        if (current is < 0 or > 2) throw new InvalidOperationException("Unsupported database schema version.");
+        for (int next = current + 1; next <= 2; next++)
+        {
+            string name = next == 1 ? "001_initial.sql" : "002_inventory.sql";
+            await using var stream = typeof(SqlStore).Assembly.GetManifestResourceStream("Fablewood.Backend.Migrations." + name) ?? throw new InvalidOperationException("Embedded migration missing.");
+            using var reader = new StreamReader(stream);
+            await using var migration = Command(connection, transaction, await reader.ReadToEndAsync(ct));
+            await migration.ExecuteNonQueryAsync(ct);
+        }
         await transaction.CommitAsync(ct);
     }
     public async Task Health(CancellationToken ct)
     {
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var command = Command(connection, null, "SELECT max(version) FROM schema_migrations");
-        if (Convert.ToInt32(await command.ExecuteScalarAsync(ct)) != 1) throw new ApiError(503, "database_unavailable", "데이터베이스 준비가 필요합니다.");
+        if (Convert.ToInt32(await command.ExecuteScalarAsync(ct)) != 2) throw new ApiError(503, "database_unavailable", "데이터베이스 준비가 필요합니다.");
     }
     public async Task<Guid> CreateAccount(AccountRequest request, CancellationToken ct)
     {
@@ -82,13 +90,13 @@ public sealed class SqlStore(BackendOptions options) : IAsyncDisposable
         await using var insert = Command(connection, null, "INSERT INTO join_tickets(token_hash,player_id,expires_at) VALUES($1,$2,clock_timestamp()+interval '180 seconds') RETURNING expires_at", Rules.TokenHash(ticket), player);
         return new { ticket, expiresAt = (DateTime)(await insert.ExecuteScalarAsync(ct))! };
     }
-    private sealed record ProfileRow(long Revision, byte[]? Profile, Wallet Wallet, Guid? LeaseId, bool LeaseActive, int InitialClass);
+    private sealed record ProfileRow(long Revision, byte[]? Profile, Wallet Wallet, Guid? LeaseId, bool LeaseActive, int InitialClass, int InventoryVersion);
     private static async Task<ProfileRow> LockedProfile(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid player, CancellationToken ct)
     {
-        await using var query = Command(connection, transaction, "SELECT p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.lease_id,COALESCE(p.lease_expires_at>clock_timestamp(),false),a.initial_class FROM profiles p JOIN accounts a ON a.player_id=p.player_id WHERE p.player_id=$1 FOR UPDATE OF p", player);
+        await using var query = Command(connection, transaction, "SELECT p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.lease_id,COALESCE(p.lease_expires_at>clock_timestamp(),false),a.initial_class,p.inventory_version FROM profiles p JOIN accounts a ON a.player_id=p.player_id WHERE p.player_id=$1 FOR UPDATE OF p", player);
         await using var reader = await query.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ApiError(404, "player_missing", "플레이어를 찾을 수 없습니다.");
-        return new(reader.GetInt64(0), reader.IsDBNull(1) ? null : reader.GetFieldValue<byte[]>(1), ReadWallet(reader, 2), reader.IsDBNull(9) ? null : reader.GetGuid(9), reader.GetBoolean(10), reader.GetInt32(11));
+        return new(reader.GetInt64(0), reader.IsDBNull(1) ? null : reader.GetFieldValue<byte[]>(1), ReadWallet(reader, 2), reader.IsDBNull(9) ? null : reader.GetGuid(9), reader.GetBoolean(10), reader.GetInt32(11), reader.GetInt32(12));
     }
     private static Wallet ReadWallet(NpgsqlDataReader reader, int start) => new(reader.GetInt32(start), reader.GetInt32(start+1), reader.GetInt32(start+2), reader.GetInt32(start+3), reader.GetInt32(start+4), reader.GetInt32(start+5), reader.GetInt32(start+6));
     public async Task<ClaimResponse> Claim(ClaimRequest request, CancellationToken ct)
@@ -111,8 +119,9 @@ public sealed class SqlStore(BackendOptions options) : IAsyncDisposable
         var lease = Guid.NewGuid();
         await using var update = Command(connection, transaction, "UPDATE profiles SET lease_id=$2,lease_server=$3,lease_expires_at=clock_timestamp()+interval '60 seconds' WHERE player_id=$1 RETURNING lease_expires_at", player, lease, request.ServerId);
         var expiry = (DateTime)(await update.ExecuteScalarAsync(ct))!;
+        var inventory = await LoadInventory(connection, transaction, player, profile.InventoryVersion, ct);
         await transaction.CommitAsync(ct);
-        return new(player, lease, expiry, profile.Revision, profile.InitialClass, profile.Profile is null ? null : Convert.ToBase64String(profile.Profile), profile.Profile is null ? null : Convert.ToHexStringLower(SHA256.HashData(profile.Profile)), profile.Wallet);
+        return new(player, lease, expiry, profile.Revision, profile.InitialClass, profile.Profile is null ? null : Convert.ToBase64String(profile.Profile), profile.Profile is null ? null : Convert.ToHexStringLower(SHA256.HashData(profile.Profile)), profile.Wallet, profile.InventoryVersion, inventory);
     }
     public async Task<CommitResponse> Commit(CommitRequest request, CancellationToken ct)
     {
@@ -133,6 +142,7 @@ public sealed class SqlStore(BackendOptions options) : IAsyncDisposable
         }
         if (profile.LeaseId != request.LeaseId || !profile.LeaseActive) throw new ApiError(409, "lease_lost", "저장 권한이 만료되었거나 다른 접속으로 바뀌었습니다.");
         if (profile.Revision != request.ExpectedRevision) throw new ApiError(409, "revision_conflict", "더 최신 저장이 존재합니다.");
+        if (profile.InventoryVersion != 0) throw new ApiError(409, "inventory_required", "구조화 장비 저장이 필요한 프로필입니다.");
         var w = request.Wallet; long revision;
         await using (var update = Command(connection, transaction, "UPDATE profiles SET revision=revision+1,profile=$4,gold=$5,ore=$6,essence=$7,root_cores=$8,moon_crystals=$9,health_potions=$10,mana_potions=$11,updated_at=clock_timestamp() WHERE player_id=$1 AND lease_id=$2 AND revision=$3 AND lease_expires_at>clock_timestamp() RETURNING revision", request.PlayerId, request.LeaseId, request.ExpectedRevision, blob, w.Gold, w.Ore, w.Essence, w.RootCores, w.MoonCrystals, w.HealthPotions, w.ManaPotions))
         {
