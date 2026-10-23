@@ -197,22 +197,22 @@ internal static partial class Program
         var before = (string?)await Sql(legacy, originalRows, player) ?? throw new InvalidOperationException("Schema-one fixture not created.");
         Check(Convert.ToInt32(await Sql(legacy, "SELECT max(version) FROM schema_migrations")) == 1, "legacy migration fixture starts at real schema one");
         await using (var store = new SqlStore(legacy)) { await store.Migrate(CancellationToken.None); await store.Migrate(CancellationToken.None); }
-        Check(Convert.ToInt32(await Sql(legacy, "SELECT max(version) FROM schema_migrations")) == 2 && (string?)await Sql(legacy, originalRows, player) == before,
-            "schema one to two repeated migration preserves every original account/profile/wallet/operation/ledger column");
+        Check(Convert.ToInt32(await Sql(legacy, "SELECT max(version) FROM schema_migrations")) == 3 && (string?)await Sql(legacy, originalRows, player) == before,
+            "schema one to three repeated migration preserves every original account/profile/wallet/operation/ledger column");
         Check(Convert.ToInt32(await Sql(legacy, "SELECT inventory_version FROM profiles WHERE player_id=$1", player)) == 0
             && Convert.ToInt64(await Sql(legacy, "SELECT count(*) FROM inventory_items")) == 0
             && Convert.ToInt64(await Sql(legacy, "SELECT count(*) FROM inventory_journal")) == 0,
             "schema migration keeps legacy profile unbackfilled without fabricating items");
         return new { schema = legacy.Schema, playerId = player, originalProfileSha256 = Convert.ToHexStringLower(SHA256.HashData(bytes)),
-            originalRowsSha256 = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(before))), sourceSchemaVersion = 1, targetSchemaVersion = 2,
+            originalRowsSha256 = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(before))), sourceSchemaVersion = 1, targetSchemaVersion = 3,
             fixtureScope = "Synthetic backend contract rows in an isolated schema, not a real UE SaveGame." };
     }
     private static async Task RunInventorySuite(BackendOptions options, string output)
     {
         var firstCheck = Checks.Count;
         var legacySchemaMigration = await VerifySchemaOneMigration(options);
-        Check(Convert.ToInt32(await Sql(options, "SELECT max(version) FROM schema_migrations")) == 2,
-            "inventory migration schema version two after repeated migration");
+        Check(Convert.ToInt32(await Sql(options, "SELECT max(version) FROM schema_migrations")) == 3,
+            "inventory migration schema version three after repeated migration");
         var app = BackendApplication.Build(options); app.Urls.Clear(); app.Urls.Add("http://127.0.0.1:0"); await app.StartAsync();
         InventoryCheckpoint? checkpoint = null;
         try

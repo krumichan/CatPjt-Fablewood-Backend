@@ -44,7 +44,7 @@ internal static partial class Program
     {
         if (!System.Text.RegularExpressions.Regex.IsMatch(schema, "^fable_test_[a-f0-9]{32}$")) throw new InvalidOperationException("Refusing a non-test schema.");
         var connection = new NpgsqlConnectionStringBuilder(configured.ConnectionString) { SearchPath = schema };
-        return new(connection.ConnectionString, schema, configured.ServerKey);
+        return configured with { ConnectionString = connection.ConnectionString, Schema = schema };
     }
     private static async Task WriteNew(string path, object value)
     {
@@ -83,6 +83,14 @@ internal static partial class Program
                         ?? throw new InvalidOperationException("Missing inventory checkpoint.");
                     if (inventoryCheckpoint.Schema != expected.Schema) throw new InvalidOperationException("Inventory checkpoint belongs to a different isolated schema.");
                     await VerifyInventoryPersistence(Isolated(configured, expected.Schema), inventoryCheckpoint);
+                }
+                var characterCheckpointPath = Path.Combine(Path.GetDirectoryName(path)!, "character-persistence-checkpoint.json");
+                if (File.Exists(characterCheckpointPath))
+                {
+                    var characterCheckpoint = JsonSerializer.Deserialize<CharacterCheckpoint>(await File.ReadAllTextAsync(characterCheckpointPath), Json)
+                        ?? throw new InvalidOperationException("Missing character checkpoint.");
+                    if (characterCheckpoint.Schema != expected.Schema) throw new InvalidOperationException("Character checkpoint schema mismatch.");
+                    await VerifyCharacterPersistence(Isolated(configured, expected.Schema), characterCheckpoint);
                 }
                 await WriteNew(Path.Combine(Path.GetDirectoryName(path)!, "persistence-after-reconnect.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, expected.Schema, checks = Checks, scope = "New connection after an operator-controlled restart; this program does not restart PostgreSQL or assert that a restart occurred." });
                 return 0;
@@ -193,7 +201,10 @@ internal static partial class Program
             var legacyCheckCount = Checks.Count;
             await WriteNew(Path.Combine(output, "persistence-checkpoint.json"), checkpoint!);
             await RunInventorySuite(options, output);
-            await WriteNew(Path.Combine(output, "integration.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, options.Schema, legacyCheckCount, inventoryCheckCount = Checks.Count - legacyCheckCount, checks = Checks, databaseRestartObserved = false, scope = "Unique PostgreSQL schema, real loopback HTTP. Expiry/fault fixtures only in this schema. PostgreSQL restart is an explicit operator follow-up; no real game profile was mutated." });
+            var inventoryCheckCount = Checks.Count - legacyCheckCount;
+            if (inventoryCheckCount != 251) throw new InvalidOperationException("The preserved inventory regression must complete 251 checks.");
+            await RunCharacterSuite(options, output);
+            await WriteNew(Path.Combine(output, "integration.json"), new { status = "passed", checkedUtc = DateTime.UtcNow, options.Schema, legacyCheckCount, inventoryCheckCount, characterCheckCount = Checks.Count - legacyCheckCount - inventoryCheckCount, checks = Checks, databaseRestartObserved = false, scope = "Unique PostgreSQL schema, real loopback HTTP. Expiry/fault fixtures only in this schema. PostgreSQL restart is an explicit operator follow-up; no real game profile was mutated." });
             Console.WriteLine("Integration checks passed. Preserve the isolated schema for explicit restart verification."); return 0;
         }
         catch (PostgresException error)
