@@ -123,3 +123,79 @@ API・統合検査・Tools・指定ルートファイルを含め、新しい In
 현재 두 저장소의 소스·필수 자산 선택 집합은 308개이며 비밀 설정과 실행 산출물은 포함하지 않습니다. 이 검사는 알려진 비밀 값·일반 설정 패턴과 파일 목록을 확인하는 것이며 모든 비밀의 부재, 빌드, 실제 게임 플레이를 보증하지 않습니다. 실제 통합 검사는 고유 테스트 스키마와 증거를 보존하고 자동 삭제하지 않습니다. PostgreSQL 재시작은 운영자가 별도로 수행하며 검사 명령 자체가 DB를 재시작하지 않습니다.
 
 現在の 2 リポジトリのソース・必須アセット選択集合は 308 個で、秘密設定と実行生成物は含めません。この検査は既知の秘密値・一般的な設定パターンとファイル一覧を確認するもので、あらゆる秘密が存在しないこと、ビルド、実際のゲームプレイを保証しません。実際の統合検査では固有のテストスキーマと証拠を保全し、自動削除しません。PostgreSQL の再起動は運用者が別途行い、検査コマンド自体は DB を再起動しません。
+
+
+<a id="foundation-development-record-20261023"></a>
+
+## Foundation 개발 원문 · 2026-10-23
+
+# CatPjt-Fablewood-Backend
+
+Fablewood의 계정·접속권·캐릭터·중앙 저장 API입니다. ASP.NET Core 10, Npgsql 10.0.3, PostgreSQL 18을 사용합니다. 형제 `CatPjt-Fablewood-Game`의 Unreal 전용 서버가 이동·전투·보상·거래를 판정하고, API가 소유권·세션·저장 트랜잭션을 검증합니다.
+
+이번 작업 경로는 `D:\GameProjects\Fablewood-OnlineFlow-20261023\CatPjt-Fablewood-Backend`입니다. 기존 원본, Git 등록 중인 저장소와 완료된 Inventory 작업본·서비스·데이터는 보존합니다.
+
+## 현재 상태
+
+2026-10-23 공용 데스크톱의 .NET SDK 10.0.401로 API와 통합 검사 프로젝트를 잠금 복원 Release 빌드했고 경고 0개·오류 0개로 통과했습니다. 스키마 3 HTTP/PostgreSQL 556개와 실제 PostgreSQL 재시작 후 영구 저장 42개는 `20261023T082744298Z-adce3e5f`에서 통과했습니다. 해당 API·SQL·검사 코드는 유지했고, 이후 수정한 Windows ACL 런처는 `20261023T131351827Z-3d0a125a`의 실제 5개 사례와 최종 온라인 작업으로 검증했습니다. `20261023T131703552Z-fa59464f`에서 Unreal Editor 전용 서버 1개·렌더링 클라이언트 2개가 같은 DB의 API 재시작 전후 동일 캐릭터·재화·장비·아이템·요약으로 재로그인했습니다. 한 PC loopback 결과이며 독립 Server Target·Linux·외부망은 미검증입니다.
+
+이전 Inventory 단계에서 통과한 통합 316개·DB 재시작 지속성 23개·native 18개·실제 2인 장비 검사는 이전 소스의 결과입니다. 이번 캐릭터·세션·안전 퇴장 확장의 통과 근거로 재사용하지 않습니다. 새 회귀 검사는 소스에 포함되어 있습니다.
+
+## 구성과 빌드
+
+- `Fablewood.Backend/`: API, SQL migration 001~003, package lock, [API 계약](Fablewood.Backend/README.md).
+- `Fablewood.Backend.IntegrationTests/`: 실제 HTTP/PostgreSQL 검사, 고유 테스트 스키마 사용.
+- `Tools/Start-Backend.ps1`, `Start-Backend.cmd`: Windows의 소유권 확인 실행기.
+- `compose.yaml`, `.env.example`: PostgreSQL 정의와 비밀 없는 예시.
+- `global.json`: .NET SDK 10.0.401, latestPatch, 미리 보기 제외.
+
+PowerShell 7.4 이상과 SDK를 준비한 데스크톱에서 아래 명령을 사용합니다. lock 파일을 변경하지 않습니다.
+
+```powershell
+dotnet restore .\Fablewood.Backend\Fablewood.Backend.csproj --locked-mode
+dotnet restore .\Fablewood.Backend.IntegrationTests\Fablewood.Backend.IntegrationTests.csproj --locked-mode
+dotnet build .\Fablewood.Backend.IntegrationTests\Fablewood.Backend.IntegrationTests.csproj -c Release --no-restore
+```
+
+통합 검사 프로젝트가 API를 참조합니다. 실행기는 `bin/Release/net10.0` 빌드를 요구하고 자동 빌드하지 않습니다. 모든 `bin/obj`, 로그와 상태는 소스 배포에서 제외합니다.
+
+## 캐릭터·세션·저장
+
+DB 스키마는 **3**, UE SaveGame은 v9, 정형 장비·캐릭터 요약은 각각 버전 1입니다. `GET /v1/me/character`는 로그인한 계정 하나의 이름·직업·레벨·전직·재화·장비 미리보기를 반환합니다. 기존 프로필에 요약이 없으면 null을 유지하고 UE가 첫 접속 시 실제 SaveGame을 검증해 백필합니다. API가 Unreal blob을 해독하거나 임의의 기존 레벨을 생성하지 않습니다.
+
+`POST /v1/server/commit-character`는 blob·재화 7종·전체 장비/옵션·요약·receipt·ledger·journal을 한 트랜잭션으로 확정합니다. 서버 인증, 소유 계정의 writer 리스, expected revision과 요청 해시를 확인합니다. 같은 성공 작업은 재시도할 수 있지만 다른 payload·이전 리스·revision 충돌은 거절합니다. 이전 commit 경로의 과거 receipt 조회도 보존합니다. 신규 요약 저장 이후 구버전 API로 새 변형을 저장하지 않습니다.
+
+`GET /v1/servers`는 설정된 서버 목록이며 health ping이 아닙니다. `POST /v1/sessions/logout`은 현재 세션과 그 세션의 미사용 접속권을 취소합니다. 이미 claim한 writer 리스는 저장 완료까지 유지합니다. `POST /v1/server/release-confirmed`는 반환 receipt를 남겨 성공 응답 유실 후 재시도할 수 있고, 새 접속의 리스를 해제하지 않습니다.
+
+아이템 UUID·소유자·기존 로컬 ID·가방/창고 순서·장착·품질·등급·옵션·강화·내구도는 중앙 저장합니다. 삭제된 ID 이력도 보존합니다. 전투·가격·보상 판정은 UE 권위이며, 로컬 `.sav` 자동 업로드는 없습니다. 자세한 DTO·오류·이전 규칙은 API 계약 문서를 따릅니다.
+
+## 이번 별도 인스턴스
+
+다음 명령은 상태 조회가 아니라 새 PostgreSQL·API 기동과 migration 1→3을 수행합니다. 아래 고정 이름의 예시 명령은 직접 실행하지 않았습니다. 실제 검증에서는 작업별 고유 컨테이너·volume·schema를 생성하고 같은 DB를 유지한 API 재시작과 재접속을 확인했습니다. 데스크톱의 Docker와 Release 빌드 준비 후 사용합니다.
+
+```powershell
+pwsh -NoProfile -File .\Tools\Start-Backend.ps1 `
+  -ContainerName fablewood-onlineflow-20261023-postgres `
+  -VolumeName fablewood-onlineflow-20261023-data `
+  -ComposeProject fablewood-onlineflow-20261023 `
+  -DatabasePort 55440 -ApiPort 5292 `
+  -Schema fable_onlineflow_20261023 -ServerId onlineflow-dedicated-20261023
+```
+
+예약 주소는 API `http://127.0.0.1:5292`, PostgreSQL `127.0.0.1:55440`, DB 이름 `fablewood`입니다. 실행기 기본값은 기존 서비스이므로 이번 작업에는 위 격리 인자를 반드시 명시합니다. 원본 `5281/55438`, Inventory `5291/55439`나 기존 볼륨·키를 재사용하지 않습니다.
+
+기본 서버 목록은 `onlineflow-local`, 이름 `동화숲`, 주소 `127.0.0.1:7821`입니다. 수동 환경 설정은 `FABLE_GAME_SERVER_ID`, `FABLE_GAME_SERVER_NAME`, `FABLE_GAME_ADDRESS`를 사용하며 Unreal 포트와 일치시킵니다. 현재 IPv4/DNS:port를 지원하고 IPv6 주소는 지원하지 않습니다.
+
+비밀번호·서버 키·UE 설정·소유 상태는 이 루트의 `Saved/Backend/`에 생성합니다. 대응 자격 증명이 없는 기존 볼륨, 다른 경로·포트·schema·소유 프로세스는 초기화하지 않고 거절합니다. `-Restart`는 실행 파일·PID·시작 시각이 확인된 이 작업본의 API에만 적용하고 DB 볼륨을 유지합니다. 설정을 다른 작업본에서 복사하지 않습니다.
+
+NTFS에서 비공개 폴더 ACL을 제한하며 exFAT에는 사용자별 ACL이 없습니다. DB 연결·키를 소스나 공개 로그·명령줄에 넣지 않습니다. 원격 API는 HTTPS가 필수입니다. `/health`는 DB와 스키마 3을 확인합니다. 입장권은 180초·단일 사용, writer 리스는 60초입니다.
+
+## Unreal 연동과 Git 입력
+
+백엔드 준비 후 형제 게임에서 `Start-OnlineServer.cmd -BackendRoot ..\CatPjt-Fablewood-Backend -Port 7821`, `Play-Account.cmd -BackendUrl http://127.0.0.1:5292`를 사용합니다. 서버 실행기는 해당 백엔드의 저장된 소유 상태와 비공개 `server.json`을 선택합니다. 새 계정 화면의 검증은 게임 `Tools/Test-OnlineFlow.ps1`이 담당합니다. 독립 Server Target·Linux·외부망·이번 Windows Game 패키지 실행 플레이는 미검증입니다.
+
+```powershell
+pwsh -NoProfile -File .\Tools\Get-SourceManifest.ps1
+```
+
+매니페스트는 API·필수 통합 검사·SQL 001~003·Tools·SDK pin·lock·허용된 루트 파일을 SHA-256과 함께 수집합니다. `Saved`, `bin/obj`, artifacts, DB 볼륨·사용자 데이터·자격 증명·키·실행 상태·로그는 제외합니다. 형제 게임의 필수 `.uasset/.umap`과 원본 OBJ는 게임 매니페스트가 별도로 포함합니다. 매니페스트는 빌드·실행 결과나 모든 비밀의 부재를 보증하지 않습니다. 테스트 스키마와 증거는 자동 삭제하지 않습니다.
