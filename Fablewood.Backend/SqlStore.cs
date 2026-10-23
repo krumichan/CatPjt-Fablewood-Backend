@@ -26,10 +26,10 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
         int current;
         await using (var version = Command(connection, transaction, "SELECT COALESCE(max(version),0) FROM schema_migrations"))
             current = Convert.ToInt32(await version.ExecuteScalarAsync(ct));
-        if (current is < 0 or > 2) throw new InvalidOperationException("Unsupported database schema version.");
-        for (int next = current + 1; next <= 2; next++)
+        if (current is < 0 or > 3) throw new InvalidOperationException("Unsupported database schema version.");
+        for (int next = current + 1; next <= 3; next++)
         {
-            string name = next == 1 ? "001_initial.sql" : "002_inventory.sql";
+            string name = next switch { 1 => "001_initial.sql", 2 => "002_inventory.sql", _ => "003_character.sql" };
             await using var stream = typeof(SqlStore).Assembly.GetManifestResourceStream("Fablewood.Backend.Migrations." + name) ?? throw new InvalidOperationException("Embedded migration missing.");
             using var reader = new StreamReader(stream);
             await using var migration = Command(connection, transaction, await reader.ReadToEndAsync(ct));
@@ -41,7 +41,7 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
     {
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var command = Command(connection, null, "SELECT max(version) FROM schema_migrations");
-        if (Convert.ToInt32(await command.ExecuteScalarAsync(ct)) != 2) throw new ApiError(503, "database_unavailable", "데이터베이스 준비가 필요합니다.");
+        if (Convert.ToInt32(await command.ExecuteScalarAsync(ct)) != 3) throw new ApiError(503, "database_unavailable", "데이터베이스 준비가 필요합니다.");
     }
     public async Task<Guid> CreateAccount(AccountRequest request, CancellationToken ct)
     {
@@ -82,21 +82,25 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
         var result = await query.ExecuteScalarAsync(ct);
         return result is Guid id ? id : throw new ApiError(401, "session_expired", "로그인이 만료되었습니다.");
     }
-    public async Task<object> IssueTicket(Guid player, CancellationToken ct)
+    public async Task<object> IssueTicket(string? sessionToken, CancellationToken ct)
     {
-        var ticket = Rules.Token();
+        var sessionHash = Rules.TokenHash(sessionToken); var ticket = Rules.Token();
         await using var connection = await data.OpenConnectionAsync(ct);
-        // Three minutes allow a cold UE client startup; claim still consumes this hashed ticket once.
-        await using var insert = Command(connection, null, "INSERT INTO join_tickets(token_hash,player_id,expires_at) VALUES($1,$2,clock_timestamp()+interval '180 seconds') RETURNING expires_at", Rules.TokenHash(ticket), player);
-        return new { ticket, expiresAt = (DateTime)(await insert.ExecuteScalarAsync(ct))! };
+        await using var transaction = await connection.BeginTransactionAsync(ct);
+        var player = await LockSession(connection, transaction, sessionHash, ct);
+        // Lock order is session -> ticket -> profile, also used by claim/logout.
+        await using var insert = Command(connection, transaction, "INSERT INTO join_tickets(token_hash,player_id,expires_at,session_token_hash) VALUES($1,$2,clock_timestamp()+interval '180 seconds',$3) RETURNING expires_at", Rules.TokenHash(ticket), player, sessionHash);
+        var expiry = (DateTime)(await insert.ExecuteScalarAsync(ct))!;
+        await transaction.CommitAsync(ct);
+        return new { ticket, expiresAt = expiry };
     }
-    private sealed record ProfileRow(long Revision, byte[]? Profile, Wallet Wallet, Guid? LeaseId, bool LeaseActive, int InitialClass, int InventoryVersion);
+    private sealed record ProfileRow(long Revision, byte[]? Profile, Wallet Wallet, Guid? LeaseId, bool LeaseActive, int InitialClass, int InventoryVersion, int SummaryVersion);
     private static async Task<ProfileRow> LockedProfile(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid player, CancellationToken ct)
     {
-        await using var query = Command(connection, transaction, "SELECT p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.lease_id,COALESCE(p.lease_expires_at>clock_timestamp(),false),a.initial_class,p.inventory_version FROM profiles p JOIN accounts a ON a.player_id=p.player_id WHERE p.player_id=$1 FOR UPDATE OF p", player);
+        await using var query = Command(connection, transaction, "SELECT p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.lease_id,COALESCE(p.lease_expires_at>clock_timestamp(),false),a.initial_class,p.inventory_version,COALESCE(s.version,0) FROM profiles p JOIN accounts a ON a.player_id=p.player_id LEFT JOIN character_summaries s ON s.player_id=p.player_id WHERE p.player_id=$1 FOR UPDATE OF p", player);
         await using var reader = await query.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ApiError(404, "player_missing", "플레이어를 찾을 수 없습니다.");
-        return new(reader.GetInt64(0), reader.IsDBNull(1) ? null : reader.GetFieldValue<byte[]>(1), ReadWallet(reader, 2), reader.IsDBNull(9) ? null : reader.GetGuid(9), reader.GetBoolean(10), reader.GetInt32(11), reader.GetInt32(12));
+        return new(reader.GetInt64(0), reader.IsDBNull(1) ? null : reader.GetFieldValue<byte[]>(1), ReadWallet(reader, 2), reader.IsDBNull(9) ? null : reader.GetGuid(9), reader.GetBoolean(10), reader.GetInt32(11), reader.GetInt32(12), reader.GetInt32(13));
     }
     private static Wallet ReadWallet(NpgsqlDataReader reader, int start) => new(reader.GetInt32(start), reader.GetInt32(start+1), reader.GetInt32(start+2), reader.GetInt32(start+3), reader.GetInt32(start+4), reader.GetInt32(start+5), reader.GetInt32(start+6));
     public async Task<ClaimResponse> Claim(ClaimRequest request, CancellationToken ct)
@@ -104,6 +108,12 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
         Rules.Server(request.ServerId); var hash = Rules.TokenHash(request.Ticket);
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
+        Guid? sessionPlayer = null;
+        await using (var session = Command(connection, transaction, "SELECT session_token_hash FROM join_tickets WHERE token_hash=$1", hash))
+        {
+            if (await session.ExecuteScalarAsync(ct) is byte[] sessionHash)
+                sessionPlayer = await LockSession(connection, transaction, sessionHash, ct);
+        }
         Guid player;
         await using (var ticket = Command(connection, transaction, "SELECT player_id,consumed_at,expires_at>clock_timestamp() FROM join_tickets WHERE token_hash=$1 FOR UPDATE", hash))
         await using (var reader = await ticket.ExecuteReaderAsync(ct))
@@ -112,6 +122,8 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
             if (!reader.IsDBNull(1)) throw new ApiError(409, "ticket_used", "이미 사용한 입장권입니다.");
             player = reader.GetGuid(0);
         }
+        if (sessionPlayer is Guid sessionOwner && sessionOwner != player)
+            throw new ApiError(401, "ticket_expired", "입장권을 확인할 수 없습니다.");
         var profile = await LockedProfile(connection, transaction, player, ct);
         if (profile.LeaseActive) throw new ApiError(409, "already_online", "다른 접속이 아직 해당 캐릭터를 사용 중입니다.");
         await using (var consume = Command(connection, transaction, "UPDATE join_tickets SET consumed_at=clock_timestamp() WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>clock_timestamp()", hash))
@@ -120,8 +132,9 @@ public sealed partial class SqlStore(BackendOptions options) : IAsyncDisposable
         await using var update = Command(connection, transaction, "UPDATE profiles SET lease_id=$2,lease_server=$3,lease_expires_at=clock_timestamp()+interval '60 seconds' WHERE player_id=$1 RETURNING lease_expires_at", player, lease, request.ServerId);
         var expiry = (DateTime)(await update.ExecuteScalarAsync(ct))!;
         var inventory = await LoadInventory(connection, transaction, player, profile.InventoryVersion, ct);
+        var summary = await LoadSummary(connection, transaction, player, ct);
         await transaction.CommitAsync(ct);
-        return new(player, lease, expiry, profile.Revision, profile.InitialClass, profile.Profile is null ? null : Convert.ToBase64String(profile.Profile), profile.Profile is null ? null : Convert.ToHexStringLower(SHA256.HashData(profile.Profile)), profile.Wallet, profile.InventoryVersion, inventory);
+        return new(player, lease, expiry, profile.Revision, profile.InitialClass, profile.Profile is null ? null : Convert.ToBase64String(profile.Profile), profile.Profile is null ? null : Convert.ToHexStringLower(SHA256.HashData(profile.Profile)), profile.Wallet, profile.InventoryVersion, inventory, summary);
     }
     public async Task<CommitResponse> Commit(CommitRequest request, CancellationToken ct)
     {

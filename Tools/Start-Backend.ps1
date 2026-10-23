@@ -119,18 +119,44 @@ if (Test-Path -LiteralPath $statePath) {
 if (-not $ownedProcess) { Assert-LoopbackPortFree $ApiPort 'Backend API' }
 [IO.Directory]::CreateDirectory($privateRoot) | Out-Null
 # exFAT cannot enforce per-user ACLs. Keep all live secrets in this Git-excluded folder.
+function Test-BackendPrivateDirectoryAcl($Descriptor,[string[]]$AllowedSids) {
+    if (-not $Descriptor.AreAccessRulesProtected -or $AllowedSids.Count -ne 3) { return $false }
+    $rules=@($Descriptor.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 3) { return $false }
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $expectedInheritance=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    foreach ($rule in $rules) {
+        $ruleSid=$rule.IdentityReference.Value
+        if ($ruleSid -cnotin $AllowedSids -or -not $seen.Add($ruleSid) -or $rule.IsInherited -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or
+            $rule.InheritanceFlags -ne $expectedInheritance -or
+            $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) { return $false }
+    }
+    return $seen.Count -eq 3
+}
 $aclProtected=$false
 try {
     $drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($privateRoot))
     if ($drive.DriveFormat -eq 'NTFS') {
-        $acl=[Security.AccessControl.DirectorySecurity]::new()
-        $acl.SetAccessRuleProtection($true,$false)
         $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
-        $inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
-        foreach ($principal in @($sid,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl',$inherit,'None','Allow'))
+        $allowedSids=@($sid.Value,'S-1-5-18','S-1-5-32-544')
+        $acl=Get-Acl -LiteralPath $privateRoot
+        $originalOwner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $originalGroup=$acl.GetGroup([Security.Principal.SecurityIdentifier]).Value
+        if (-not (Test-BackendPrivateDirectoryAcl $acl $allowedSids)) {
+            $acl.SetAccessRuleProtection($true,$false)
+            foreach ($rule in @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]))) { $acl.RemoveAccessRuleSpecific($rule) }
+            $inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+            foreach ($principal in @($sid,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl',$inherit,'None','Allow'))
+            }
+            Set-Acl -LiteralPath $privateRoot -AclObject $acl
         }
-        Set-Acl -LiteralPath $privateRoot -AclObject $acl
+        $verifiedAcl=Get-Acl -LiteralPath $privateRoot
+        if (-not (Test-BackendPrivateDirectoryAcl $verifiedAcl $allowedSids) -or
+            $verifiedAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $originalOwner -or
+            $verifiedAcl.GetGroup([Security.Principal.SecurityIdentifier]).Value -cne $originalGroup) { throw 'Private directory ACL verification failed.' }
         $aclProtected=$true
     }
 } catch { throw 'Could not restrict the NTFS private configuration folder. No new credentials were written.' }

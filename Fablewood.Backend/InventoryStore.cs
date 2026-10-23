@@ -66,14 +66,17 @@ public sealed partial class SqlStore
         return new { playerId = player, revision, profileHash, inventoryVersion, inventory };
     }
 
-    public async Task<CommitInventoryResponse> CommitInventory(CommitInventoryRequest request, CancellationToken ct)
+    public Task<CommitInventoryResponse> CommitInventory(CommitInventoryRequest request, CancellationToken ct) =>
+        CommitInventoryCore(request, Rules.InventoryRequestHash(request), null, ct);
+
+    private async Task<CommitInventoryResponse> CommitInventoryCore(CommitInventoryRequest request, byte[] hash, CharacterSummary? summary, CancellationToken ct)
     {
         Rules.Identifiers(request.PlayerId, request.LeaseId, request.OperationId);
         if (request.ExpectedRevision < 0 || request.ExpectedRevision == long.MaxValue || request.Wallet is null)
             throw new ApiError(400, "invalid_commit", "저장 요청이 올바르지 않습니다.");
         request.Wallet.Validate(); Rules.ValidateInventory(request.Inventory);
         var snapshot = request.Inventory;
-        var blob = Rules.Profile(request.Profile); var hash = Rules.InventoryRequestHash(request);
+        var blob = Rules.Profile(request.Profile);
         string profileHash = Convert.ToHexStringLower(SHA256.HashData(blob));
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
@@ -92,6 +95,9 @@ public sealed partial class SqlStore
         if (profile.LeaseId != request.LeaseId || !profile.LeaseActive)
             throw new ApiError(409, "lease_lost", "저장 권한이 만료되었거나 다른 접속으로 바뀌었습니다.");
         if (profile.Revision != request.ExpectedRevision) throw new ApiError(409, "revision_conflict", "더 최신 저장이 존재합니다.");
+        if (summary is null && profile.SummaryVersion != 0)
+            throw new ApiError(409, "summary_required", "캐릭터 정보를 포함한 저장이 필요한 프로필입니다.");
+        var beforeSummary = await LoadSummary(connection, transaction, request.PlayerId, ct);
         var before = await LoadInventory(connection, transaction, request.PlayerId, profile.InventoryVersion, ct);
         if (before is not null && snapshot.NextLocalId < before.NextLocalId) throw InventoryConflict();
 
@@ -148,6 +154,8 @@ public sealed partial class SqlStore
             journal.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = JsonSerializer.Serialize(snapshot, InventoryJson) });
             await journal.ExecuteNonQueryAsync(ct);
         }
+        if (summary is not null)
+            await WriteSummary(connection, transaction, request.PlayerId, request.OperationId, revision, beforeSummary, summary, ct);
         await transaction.CommitAsync(ct);
         return new(revision, profileHash);
     }

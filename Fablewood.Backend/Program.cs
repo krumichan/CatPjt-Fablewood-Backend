@@ -11,6 +11,7 @@ public static class BackendApplication
 {
     public static WebApplication Build(BackendOptions options)
     {
+        options.ValidateCatalog();
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.Logging.ClearProviders(); builder.Logging.AddConsole(); builder.Logging.SetMinimumLevel(LogLevel.Warning);
         builder.WebHost.ConfigureKestrel(server => server.Limits.MaxRequestBodySize = 512 * 1024);
@@ -74,7 +75,16 @@ public static class BackendApplication
         app.MapGet("/health", async (SqlStore store, CancellationToken ct) => { await store.Health(ct); return Results.Ok(new { status = "ok" }); });
         app.MapPost("/v1/accounts", async (AccountRequest request, SqlStore store, CancellationToken ct) => Results.Created("/v1/me", new { playerId = await store.CreateAccount(request, ct) })).RequireRateLimiting("auth");
         app.MapPost("/v1/sessions", async (SessionRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.CreateSession(request, ct))).RequireRateLimiting("auth");
-        app.MapPost("/v1/join-tickets", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.IssueTicket(await store.Authenticate(Bearer(context), ct), ct))).RequireRateLimiting("tickets");
+        app.MapPost("/v1/join-tickets", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.IssueTicket(Bearer(context), ct))).RequireRateLimiting("tickets");
+        app.MapPost("/v1/sessions/logout", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.Logout(Bearer(context), ct)));
+        app.MapGet("/v1/servers", async (HttpContext context, SqlStore store, CancellationToken ct) =>
+        {
+            await store.Authenticate(Bearer(context), ct);
+            return Results.Ok(new { servers = new[] { new { id = options.GameServerId, name = options.GameServerName, address = options.GameAddress } } });
+        });
+        app.MapGet("/v1/me/character", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.MeCharacter(await store.Authenticate(Bearer(context), ct), ct)));
+        app.MapPost("/v1/server/commit-character", async (CommitCharacterRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.CommitCharacter(request, ct)));
+        app.MapPost("/v1/server/release-confirmed", async (LeaseRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.ReleaseConfirmed(request, ct)));
         app.MapGet("/v1/me", async (HttpContext context, SqlStore store, CancellationToken ct) => Results.Ok(await store.Me(await store.Authenticate(Bearer(context), ct), ct)));
         app.MapPost("/v1/server/claim", async (ClaimRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Claim(request, ct)));
         app.MapPost("/v1/server/commit", async (CommitRequest request, SqlStore store, CancellationToken ct) => Results.Ok(await store.Commit(request, ct)));
@@ -100,7 +110,7 @@ public static class Program
         {
             if (args.Length != 0 && !(args.Length == 1 && args[0] == "--migrate")) throw new InvalidOperationException("Only --migrate is supported; configure credentials through private environment/files.");
             var options = BackendOptions.FromEnvironment();
-            if (args.Length == 1) { await using var store = new SqlStore(options); await store.Migrate(CancellationToken.None); Console.WriteLine("Database schema version 2 ready."); return 0; }
+            if (args.Length == 1) { await using var store = new SqlStore(options); await store.Migrate(CancellationToken.None); Console.WriteLine("Database schema version 3 ready."); return 0; }
             await using var app = BackendApplication.Build(options); await app.RunAsync(); return 0;
         }
         catch (Exception error)
