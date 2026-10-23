@@ -1,0 +1,36 @@
+# Generated .NET outputs and local tooling state
+**/bin/
+**/obj/
+**/TestResults/
+**/artifacts/
+**/.vs/
+**/.idea/
+**/.local/
+**/__pycache__/
+*.pyc
+*.user
+*.suo
+*.log
+*.tmp
+# Runtime ownership, logs, credentials and generated server configuration
+/Saved/
+**/.secrets/
+**/.data/
+**/data/
+**/postgres-data/
+**/pgdata/
+**/volumes/
+.env
+.env.*
+!.env.example
+**/appsettings.Local.json
+**/appsettings.*.local.json
+**/backend-credentials.json
+**/server-key.txt
+**/server.json
+**/backend-state.json
+*.key
+*.pem
+*.pfx
+*.p12
+# Keep both packages.lock.json files, migrations, compose and SDK pin in source.
