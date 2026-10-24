@@ -6,87 +6,217 @@ using NpgsqlTypes;
 
 namespace Fablewood.Backend;
 
+/// <summary>계정·접속 권한·프로필·장비를 트랜잭션으로 보존하는 PostgreSQL 저장소.</summary>
 public sealed partial class SqlStore
 {
-    private static async Task<CharacterSummary?> LoadSummary(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid player, CancellationToken ct)
+    /// <summary>저장된 캐릭터 요약을 읽고 현재 프로필과의 일관성을 검사한다.</summary>
+    private static async Task<CharacterSummary?> LoadSummary(NpgsqlConnection connection, NpgsqlTransaction transaction,
+                                                             Guid player, CancellationToken ct)
     {
-        await using var query = Command(connection, transaction, "SELECT s.version,s.hero_class,s.level,s.experience,s.class_tier,p.inventory_version,p.hero_class FROM character_summaries s JOIN profiles p USING(player_id) WHERE s.player_id=$1", player);
+        // 프로필과 캐릭터 요약을 같은 트랜잭션에서 조회한다.
+        await using var query = Command(
+            connection, transaction,
+            "SELECT s.version,s.hero_class,s.level,s.experience,s.class_tier,p.inventory_version,p.hero_class FROM character_summaries s JOIN profiles p USING(player_id) WHERE s.player_id=$1",
+            player);
         await using var reader = await query.ExecuteReaderAsync(ct);
-        if (!await reader.ReadAsync(ct)) return null;
-        var summary = new CharacterSummary(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3), reader.GetInt32(4));
+
+        // 저장된 요약이 없으면 빈 결과로 반환한다.
+        if (!await reader.ReadAsync(ct))
+        {
+            return null;
+        }
+
+        var summary = new CharacterSummary(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2),
+                                           reader.GetInt32(3), reader.GetInt32(4));
+
+        // 기존 인벤토리 버전·직업과 요약 계약이 맞는지 확인한다.
         try
         {
-            if (reader.GetInt32(5) != 1 || reader.IsDBNull(6)) throw new ApiError(400, "invalid_summary", "Invalid stored projection.");
+            if (reader.GetInt32(5) != 1 || reader.IsDBNull(6))
+            {
+                throw new ApiError(400, "invalid_summary", "Invalid stored projection.");
+            }
             Rules.ValidateSummary(summary, reader.GetInt32(6));
         }
-        catch (ApiError) { throw new ApiError(503, "character_unavailable", "저장된 캐릭터 정보를 확인할 수 없습니다."); }
+        catch (ApiError)
+        {
+            throw new ApiError(503, "character_unavailable", "저장된 캐릭터 정보를 확인할 수 없습니다.");
+        }
+
         return summary;
     }
+
+    /// <summary>인벤토리와 캐릭터 요약을 검증해 같은 저장 작업으로 확정한다.</summary>
     public async Task<CommitCharacterResponse> CommitCharacter(CommitCharacterRequest request, CancellationToken ct)
     {
+        // 저장할 인벤토리와 캐릭터 요약을 같은 직업 기준으로 검증한다.
         Rules.ValidateInventory(request.Inventory);
         Rules.ValidateSummary(request.Summary, request.Inventory.HeroClass);
-        var inventoryRequest = new CommitInventoryRequest(request.PlayerId, request.LeaseId, request.OperationId,
-            request.ExpectedRevision, request.Profile, request.Wallet, request.Inventory);
+
+        var inventoryRequest =
+            new CommitInventoryRequest(request.PlayerId, request.LeaseId, request.OperationId, request.ExpectedRevision,
+                                       request.Profile, request.Wallet, request.Inventory);
         var ack = await CommitInventoryCore(inventoryRequest, Rules.CharacterRequestHash(request), request.Summary, ct);
+
         return new(ack.Revision, ack.ProfileHash);
     }
-    private static async Task WriteSummary(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid player, Guid operation, long revision,
-        CharacterSummary? before, CharacterSummary after, CancellationToken ct)
+
+    /// <summary>캐릭터 요약과 해당 변경 이력을 같은 트랜잭션에 기록한다.</summary>
+    private static async Task WriteSummary(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid player,
+                                           Guid operation, long revision, CharacterSummary? before,
+                                           CharacterSummary after, CancellationToken ct)
     {
-        await using (var update = Command(connection, transaction, "INSERT INTO character_summaries(player_id,version,hero_class,level,experience,class_tier) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(player_id) DO UPDATE SET version=EXCLUDED.version,hero_class=EXCLUDED.hero_class,level=EXCLUDED.level,experience=EXCLUDED.experience,class_tier=EXCLUDED.class_tier", player, after.Version, after.HeroClass, after.Level, after.Experience, after.ClassTier))
+        // 캐릭터 요약을 갱신하고 이전·이후 요약을 변경 이력에 함께 기록한다.
+        await using (
+            var update = Command(
+                connection, transaction,
+                "INSERT INTO character_summaries(player_id,version,hero_class,level,experience,class_tier) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(player_id) DO UPDATE SET version=EXCLUDED.version,hero_class=EXCLUDED.hero_class,level=EXCLUDED.level,experience=EXCLUDED.experience,class_tier=EXCLUDED.class_tier",
+                player, after.Version, after.HeroClass, after.Level, after.Experience, after.ClassTier))
+        {
             await update.ExecuteNonQueryAsync(ct);
-        await using var journal = Command(connection, transaction, "INSERT INTO character_journal(player_id,operation_id,revision,before_summary,after_summary) VALUES($1,$2,$3,$4,$5)", player, operation, revision);
-        journal.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = before is null ? DBNull.Value : JsonSerializer.Serialize(before, InventoryJson) });
-        journal.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = JsonSerializer.Serialize(after, InventoryJson) });
+        }
+        await using var journal = Command(
+            connection, transaction,
+            "INSERT INTO character_journal(player_id,operation_id,revision,before_summary,after_summary) VALUES($1,$2,$3,$4,$5)",
+            player, operation, revision);
+        journal.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Jsonb,
+                                                     Value = before is null
+                                                                 ? DBNull.Value
+                                                                 : JsonSerializer.Serialize(before, InventoryJson) });
+        journal.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlDbType.Jsonb,
+                                                     Value = JsonSerializer.Serialize(after, InventoryJson) });
         await journal.ExecuteNonQueryAsync(ct);
     }
+
+    /// <summary>프로필·재화·인벤토리·캐릭터 요약을 같은 조회 시점으로 반환한다.</summary>
     public async Task<object> MeCharacter(Guid player, CancellationToken ct)
     {
+        // 일관된 조회 트랜잭션과 응답에 필요한 지역 변수를 준비한다.
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct);
-        string name; long revision; string? profileHash; int initialClass, inventoryVersion; Wallet wallet;
-        await using (var query = Command(connection, transaction, "SELECT a.name,a.initial_class,p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.inventory_version FROM profiles p JOIN accounts a USING(player_id) WHERE p.player_id=$1", player))
-        await using (var reader = await query.ExecuteReaderAsync(ct))
+        string name;
+        long revision;
+        string? profileHash;
+        int initialClass, inventoryVersion;
+        Wallet wallet;
+        await using (
+            var query = Command(
+                connection, transaction,
+                "SELECT a.name,a.initial_class,p.revision,p.profile,p.gold,p.ore,p.essence,p.root_cores,p.moon_crystals,p.health_potions,p.mana_potions,p.inventory_version FROM profiles p JOIN accounts a USING(player_id) WHERE p.player_id=$1",
+                player))
         {
-            if (!await reader.ReadAsync(ct)) throw new ApiError(404, "player_missing", "플레이어를 찾을 수 없습니다.");
-            name = reader.GetString(0); initialClass = reader.GetInt32(1); revision = reader.GetInt64(2);
-            profileHash = reader.IsDBNull(3) ? null : Convert.ToHexStringLower(SHA256.HashData(reader.GetFieldValue<byte[]>(3)));
-            wallet = ReadWallet(reader, 4); inventoryVersion = reader.GetInt32(11);
+            await using (var reader = await query.ExecuteReaderAsync(ct))
+            {
+                // SQL 명령과 조회 결과 조건 검사
+                if (!await reader.ReadAsync(ct))
+                {
+                    throw new ApiError(404, "player_missing", "플레이어를 찾을 수 없습니다.");
+                }
+
+                // 접속 권한·저장 리비전·멱등 키 처리
+                name = reader.GetString(0);
+                initialClass = reader.GetInt32(1);
+                revision = reader.GetInt64(2);
+                profileHash = reader.IsDBNull(3)
+                                  ? null
+                                  : Convert.ToHexStringLower(SHA256.HashData(reader.GetFieldValue<byte[]>(3)));
+                wallet = ReadWallet(reader, 4);
+                inventoryVersion = reader.GetInt32(11);
+            }
         }
         var inventory = await LoadInventory(connection, transaction, player, inventoryVersion, ct);
         var summary = await LoadSummary(connection, transaction, player, ct);
         await transaction.CommitAsync(ct);
-        return new { name, playerId = player, revision, profileHash, initialClass, wallet, inventoryVersion, inventory, summary };
+
+        return new { name,   playerId = player, revision,  profileHash, initialClass,
+                     wallet, inventoryVersion,  inventory, summary };
     }
-    private static async Task<Guid> LockSession(NpgsqlConnection connection, NpgsqlTransaction transaction, byte[] hash, CancellationToken ct)
+
+    /// <summary>트랜잭션 안에서 유효한 로그인 세션을 잠그고 소유자를 확인한다.</summary>
+    private static async Task<Guid> LockSession(NpgsqlConnection connection, NpgsqlTransaction transaction, byte[] hash,
+                                                CancellationToken ct)
     {
-        await using var query = Command(connection, transaction, "SELECT player_id FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp() FOR UPDATE", hash);
-        return await query.ExecuteScalarAsync(ct) is Guid player ? player : throw new ApiError(401, "session_expired", "로그인이 만료되었습니다.");
+        await using var query = Command(
+            connection, transaction,
+            "SELECT player_id FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp() FOR UPDATE", hash);
+        return await query.ExecuteScalarAsync(ct) is Guid player
+                   ? player
+                   : throw new ApiError(401, "session_expired", "로그인이 만료되었습니다.");
     }
+
+    /// <summary>접속 종료에 따른 세션과 소유 상태의 정리를 처리한다.</summary>
     public async Task<object> Logout(string? token, CancellationToken ct)
     {
+        // 데이터베이스 트랜잭션에 필요한 값 준비
         var hash = Rules.TokenHash(token);
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
         await LockSession(connection, transaction, hash, ct);
-        await using (var session = Command(connection, transaction, "UPDATE sessions SET expires_at=LEAST(expires_at,clock_timestamp()) WHERE token_hash=$1", hash)) await session.ExecuteNonQueryAsync(ct);
-        await using (var tickets = Command(connection, transaction, "UPDATE join_tickets SET expires_at=LEAST(expires_at,clock_timestamp()) WHERE session_token_hash=$1 AND consumed_at IS NULL", hash)) await tickets.ExecuteNonQueryAsync(ct);
+        await using (
+            var session =
+                Command(connection, transaction,
+                        "UPDATE sessions SET expires_at=LEAST(expires_at,clock_timestamp()) WHERE token_hash=$1", hash))
+        {
+            await session.ExecuteNonQueryAsync(ct);
+        }
+        await using (
+            var tickets = Command(
+                connection, transaction,
+                "UPDATE join_tickets SET expires_at=LEAST(expires_at,clock_timestamp()) WHERE session_token_hash=$1 AND consumed_at IS NULL",
+                hash))
+        {
+            await tickets.ExecuteNonQueryAsync(ct);
+        }
         // A claimed lease belongs to the game server. Do not interrupt pending durable saves.
-        await transaction.CommitAsync(ct); return new { loggedOut = true };
+        await transaction.CommitAsync(ct);
+
+        return new { loggedOut = true };
     }
+
+    /// <summary>동일 권한의 중복 반환을 허용하면서 접속 권한 해제를 확정한다.</summary>
     public async Task<object> ReleaseConfirmed(LeaseRequest request, CancellationToken ct)
     {
+        // 데이터베이스 트랜잭션 처리
         Rules.Identifiers(request.PlayerId, request.LeaseId);
         await using var connection = await data.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
         var profile = await LockedProfile(connection, transaction, request.PlayerId, ct);
-        await using (var receipt = Command(connection, transaction, "SELECT 1 FROM released_leases WHERE player_id=$1 AND lease_id=$2", request.PlayerId, request.LeaseId))
-            if (await receipt.ExecuteScalarAsync(ct) is not null) return new { released = true };
-        if (profile.LeaseId != request.LeaseId || !profile.LeaseActive) throw new ApiError(409, "lease_lost", "접속 권한이 이미 만료되었거나 다른 접속으로 바뀌었습니다.");
-        await using (var release = Command(connection, transaction, "UPDATE profiles SET lease_id=NULL,lease_server=NULL,lease_expires_at=NULL WHERE player_id=$1 AND lease_id=$2 AND lease_expires_at>clock_timestamp() RETURNING player_id", request.PlayerId, request.LeaseId))
-            if (await release.ExecuteScalarAsync(ct) is not Guid) throw new ApiError(409, "lease_lost", "접속 권한이 만료되었습니다.");
-        await using (var receipt = Command(connection, transaction, "INSERT INTO released_leases(player_id,lease_id) VALUES($1,$2)", request.PlayerId, request.LeaseId)) await receipt.ExecuteNonQueryAsync(ct);
-        await transaction.CommitAsync(ct); return new { released = true };
+        await using (var receipt = Command(connection, transaction,
+                                           "SELECT 1 FROM released_leases WHERE player_id=$1 AND lease_id=$2",
+                                           request.PlayerId, request.LeaseId))
+        {
+            if (await receipt.ExecuteScalarAsync(ct) is not null)
+            {
+                return new { released = true };
+            }
+        }
+
+        // 접속 권한·저장 리비전·멱등 키 조건 검사
+        if (profile.LeaseId != request.LeaseId || !profile.LeaseActive)
+        {
+            throw new ApiError(409, "lease_lost", "접속 권한이 이미 만료되었거나 다른 접속으로 바뀌었습니다.");
+        }
+
+        // 데이터베이스 트랜잭션 처리
+        await using (
+            var release = Command(
+                connection, transaction,
+                "UPDATE profiles SET lease_id=NULL,lease_server=NULL,lease_expires_at=NULL WHERE player_id=$1 AND lease_id=$2 AND lease_expires_at>clock_timestamp() RETURNING player_id",
+                request.PlayerId, request.LeaseId))
+        {
+            if (await release.ExecuteScalarAsync(ct) is not Guid)
+            {
+                throw new ApiError(409, "lease_lost", "접속 권한이 만료되었습니다.");
+            }
+        }
+        await using (var receipt = Command(connection, transaction,
+                                           "INSERT INTO released_leases(player_id,lease_id) VALUES($1,$2)",
+                                           request.PlayerId, request.LeaseId))
+        {
+            await receipt.ExecuteNonQueryAsync(ct);
+        }
+        await transaction.CommitAsync(ct);
+
+        return new { released = true };
     }
 }
