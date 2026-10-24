@@ -9,7 +9,7 @@ $excluded=[Collections.Generic.List[string]]::new()
 $sourceRoots=@('Fablewood.Backend','Fablewood.Backend.IntegrationTests','Tools')
 $skipDirectories=@('.git','.vs','.idea','bin','obj','artifacts','testresults','saved','__pycache__','node_modules','.local','.secrets','.data','data','postgres-data','pgdata','volumes','logs')
 $allowedExtensions=@('.cs','.csproj','.props','.targets','.json','.sql','.yaml','.yml','.md','.txt','.config','.ps1','.py','.cmd','.bat','.sh','.sln','.slnx','.http','.xml')
-$rootWhitelist=@('.gitignore','.gitattributes','.editorconfig','.dockerignore','.env.example','README.md','AGENTS.md','global.json','compose.yaml','compose.yml','Dockerfile','NuGet.Config','Directory.Build.props','Directory.Build.targets','Directory.Packages.props','Start-Backend.cmd','Fablewood.Backend.sln','Fablewood.Backend.slnx')
+$rootWhitelist=@('.gitignore','.gitattributes','.editorconfig','.clang-format','.dockerignore','.env.example','README.md','AGENTS.md','global.json','compose.yaml','compose.yml','Dockerfile','NuGet.Config','Directory.Build.props','Directory.Build.targets','Directory.Packages.props','Start-Backend.cmd','Fablewood.Backend.sln','Fablewood.Backend.slnx')
 function Get-RelativeSourcePath([string]$Path) {
     $full=[IO.Path]::GetFullPath($Path)
     if (-not $full.StartsWith($projectRoot+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw 'Source path escaped the project root.' }
